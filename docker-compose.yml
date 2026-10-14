@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: hack_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hack
+      POSTGRES_PASSWORD: hack
+      POSTGRES_DB: marketplace
+      # ускоряет инициализацию, для учебной базы безопасно
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # SQL-скрипты отсюда выполняются один раз при первом старте
+      - ./scripts/init:/docker-entrypoint-initdb.d:ro
+      # сюда кладём CSV с исходными данными: внутри контейнера это /data
+      - ./data:/data:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hack -d marketplace"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Веб-клиент на случай, если DBeaver поставить не получится.
+  # По умолчанию НЕ запускается: образ весит около 400 МБ, и если его
+  # тянуть при первом старте, кажется, что всё зависло.
+  # Запуск при необходимости:  docker compose --profile tools up -d
+  pgadmin:
+    profiles: ["tools"]
+    image: dpage/pgadmin4:8
+    container_name: hack_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: hack@local.dev
+      PGADMIN_DEFAULT_PASSWORD: hack
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "8080:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

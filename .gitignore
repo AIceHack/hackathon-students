@@ -1,0 +1,14 @@
+# Данные скачиваются скриптом, в репозиторий не кладём: 61 МБ.
+#   bash scripts/download_data.sh
+data/*.csv
+
+# Мусор macOS
+.DS_Store
+
+# Кэш Python
+__pycache__/
+*.pyc
+
+# Локальные настройки редакторов
+.idea/
+.vscode/
