@@ -12,18 +12,21 @@ $utf8 = New-Object System.Text.UTF8Encoding($false)
 $copiedFiles = New-Object 'System.Collections.Generic.List[string]'
 $localFiles = New-Object 'System.Collections.Generic.List[string]'
 $failure = $null
+$answerResults = New-Object 'System.Collections.Generic.List[string]'
+$originalOutputEncoding = [Console]::OutputEncoding
+[Console]::OutputEncoding = $utf8
 
 New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
 [System.IO.File]::WriteAllText($reportFile, '', $utf8)
 
 function Write-Log {
-    param([string]$Message)
-    Write-Host $Message
+    param([string]$Message, [switch]$Display)
+    if ($Display) { Write-Host $Message }
     [System.IO.File]::AppendAllText($reportFile, $Message + [Environment]::NewLine, $utf8)
 }
 
 function Invoke-Docker {
-    param([string[]]$Arguments, [string]$Step)
+    param([string[]]$Arguments, [string]$Step, [switch]$CollectAnswers)
     Write-Log ("==> {0}" -f $Step)
     # PowerShell 5.1 can turn native stderr into non-terminating errors.
     # Capture both streams while using the actual native process exit code.
@@ -36,9 +39,19 @@ function Invoke-Docker {
     finally {
         $ErrorActionPreference = $previousPreference
     }
-    foreach ($line in $lines) { Write-Log ([string]$line) }
+    foreach ($line in $lines) {
+        $text = [string]$line
+        Write-Log $text
+        if ($CollectAnswers -and $text -match 'NOTICE:\s+(Answer [1-5] passed:.*)$') {
+            $answerResults.Add($Matches[1])
+        }
+    }
     if ($code -ne 0) {
-        throw ("{0} failed with exit code {1}. See output above." -f $Step, $code)
+        $details = @($lines | ForEach-Object { [string]$_ } | Where-Object { $_ -match '(^|:\s*)(ERROR|FATAL|DETAIL|CONTEXT):' })
+        if ($details.Count -eq 0) { $details = @($lines | Select-Object -Last 8 | ForEach-Object { [string]$_ }) }
+        $message = "{0} failed (exit code {1})." -f $Step, $code
+        if ($details.Count -gt 0) { $message += "`n" + ($details -join "`n") }
+        throw $message
     }
 }
 
@@ -152,6 +165,7 @@ try {
     Write-Log ("Model build started: {0}" -f (Get-Date -Format o))
     Write-Log ("Project: {0}; database: {1}; report: {2}" -f $root, $Database, $reportFile)
 
+    Write-Log '[1/4] Checking files, Docker and database...' -Display
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Docker command not found.' }
     $missing = @($files | Where-Object { -not (Test-Path -LiteralPath (Join-Path $root $_) -PathType Leaf) })
     if ($missing.Count -gt 0) { throw ("Required SQL files are missing:`n  " + ($missing -join "`n  ")) }
@@ -176,6 +190,7 @@ $$;
 '@
     Invoke-Docker -Arguments @('compose', 'exec', '-T', 'postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', $User, '-d', $Database, '-c', $preflight) -Step 'Check database and raw tables'
 
+    Write-Log '[2/4] Preparing SQL files...' -Display
     $psqlArgs = @('compose', 'exec', '-T', 'postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '--single-transaction', '-U', $User, '-d', $Database)
     $index = 0
     foreach ($file in $files) {
@@ -201,12 +216,14 @@ $$;
         $psqlArgs += @('-c', ("\echo FILE {0}" -f $file), '-f', $target)
     }
     $psqlArgs += @('-c', 'SELECT pg_temp.assert_raw_unchanged();')
-    Invoke-Docker -Arguments $psqlArgs -Step 'Execute model, checks and answers in one transaction'
+    Write-Log '[3/4] Building model and running checks (this may take a few minutes)...' -Display
+    Invoke-Docker -Arguments $psqlArgs -Step 'Execute model, checks and answers in one transaction' -CollectAnswers
     Write-Log 'SQL transaction committed successfully.'
+    Write-Log '[4/4] Cleaning up temporary files...' -Display
 }
 catch {
     $failure = $_.Exception.Message
-    Write-Log ("BUILD FAILED: {0}" -f $failure)
+    Write-Log ("BUILD FAILED: {0}" -f $failure) -Display
 }
 finally {
     foreach ($localFile in $localFiles) {
@@ -227,11 +244,16 @@ finally {
         }
     }
     Pop-Location
+    [Console]::OutputEncoding = $originalOutputEncoding
 }
 
 if ($failure) {
-    Write-Log ("Build failed. Report: {0}" -f $reportFile)
+    Write-Log ("Build failed. Full report: {0}" -f $reportFile) -Display
     exit 1
 }
-Write-Log ("Build passed. Report: {0}" -f $reportFile)
+Write-Host ''
+foreach ($answerResult in $answerResults) { Write-Host ("  [OK] {0}" -f $answerResult) }
+Write-Host ''
+Write-Log 'Build passed.' -Display
+Write-Log ("Full report: {0}" -f $reportFile) -Display
 exit 0
