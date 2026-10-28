@@ -221,10 +221,10 @@ BEGIN
     -- ------------------------------------------------------------------------
     -- 5. Сверка категорий (включая неизвестные) и помесячной выручки с общим итогом
     -- ------------------------------------------------------------------------
-    -- 5.1. Категории (используем raw.product_category_translation / core.products с COALESCE для пустых категорий)
+    -- 5.1. Категории: исходный код с отдельным ключом неизвестной категории.
     WITH cat_rev AS (
         SELECT
-            COALESCE(NULLIF(btrim(p.product_category_name), ''), 'unknown') AS category_key,
+            p.category_code AS category_key,
             ROUND(SUM(oi.price)::numeric, 2) AS revenue
         FROM core.order_items oi
         INNER JOIN core.orders o   ON o.order_id = oi.order_id
@@ -236,7 +236,7 @@ BEGIN
         COUNT(*),
         COALESCE(SUM(revenue), 0),
         COALESCE(MAX(revenue), 0),
-        COALESCE(SUM(revenue) FILTER (WHERE category_key IN ('unknown', 'не указана', 'sin_categoria')), 0)
+        COALESCE(SUM(revenue) FILTER (WHERE category_key = '__unknown__'), 0)
     INTO v_cat_count, v_cat_total_rev, v_cat_max_rev, v_unknown_cat_rev
     FROM cat_rev;
 

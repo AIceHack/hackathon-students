@@ -25,6 +25,8 @@ DECLARE
     v_delivery_distinct_orders  integer;
     v_non_delivered_with_delay  integer;
     v_negative_delivery_days    integer;
+    v_bad_delivery_semantics    integer;
+    v_bad_missing_payments      integer;
     v_carrier_before_approval   integer;
     v_missing_dates_delivered   integer;
 
@@ -65,6 +67,14 @@ BEGIN
     END IF;
 
     RAISE NOTICE 'OK: mart.order_financials grain соблюдён (1 заказ = 1 строка, % строк).', v_total_orders_mart;
+
+    SELECT COUNT(*) INTO v_bad_missing_payments
+    FROM mart.order_financials f
+    WHERE NOT EXISTS (SELECT 1 FROM core.payments p WHERE p.order_id = f.order_id)
+      AND (f.payments_amount IS NOT NULL OR f.payments_count <> 0);
+    IF v_bad_missing_payments > 0 THEN
+        RAISE EXCEPTION 'TEST 1 FAILED: % заказов без платежей имеют неверную сумму или число платежей', v_bad_missing_payments;
+    END IF;
 
     -- ------------------------------------------------------------------------
     -- ТЕСТ 2: Сверка выручки (Revenue Reconciliation)
@@ -131,12 +141,35 @@ BEGIN
             v_negative_delivery_days;
     END IF;
 
+    SELECT COUNT(*) INTO v_bad_delivery_semantics
+    FROM mart.order_delivery d JOIN core.orders o USING (order_id)
+    WHERE d.has_chronology_anomaly IS DISTINCT FROM
+              COALESCE(o.order_delivered_customer_date < o.order_purchase_timestamp, false)
+       OR (d.has_chronology_anomaly AND d.days_purchase_to_delivery IS NOT NULL)
+       OR d.has_incomplete_dates IS DISTINCT FROM
+              (o.order_purchase_timestamp IS NULL OR o.order_approved_at IS NULL
+               OR o.order_delivered_carrier_date IS NULL OR o.order_delivered_customer_date IS NULL
+               OR o.order_estimated_delivery_date IS NULL)
+       OR d.is_late IS DISTINCT FROM CASE
+              WHEN o.order_status = 'delivered' AND o.order_delivered_customer_date IS NOT NULL
+                   AND o.order_estimated_delivery_date IS NOT NULL
+              THEN o.order_delivered_customer_date::date > o.order_estimated_delivery_date::date
+              ELSE NULL END
+       OR d.delivery_delay_days IS DISTINCT FROM CASE
+              WHEN o.order_status = 'delivered' AND o.order_delivered_customer_date IS NOT NULL
+                   AND o.order_estimated_delivery_date IS NOT NULL
+              THEN o.order_delivered_customer_date::date - o.order_estimated_delivery_date::date
+              ELSE NULL END;
+    IF v_bad_delivery_semantics > 0 THEN
+        RAISE EXCEPTION 'TEST 3 FAILED: некорректная семантика даты, задержки или аномалии у % заказов', v_bad_delivery_semantics;
+    END IF;
+
     -- Подсчет допустимых аномалий данных источника
     SELECT COUNT(*) INTO v_carrier_before_approval
     FROM mart.order_delivery WHERE is_carrier_before_approval = true;
 
     SELECT COUNT(*) INTO v_missing_dates_delivered
-    FROM mart.order_delivery WHERE order_status = 'delivered' AND has_missing_dates = true;
+    FROM mart.order_delivery WHERE order_status = 'delivered' AND has_incomplete_dates = true;
 
     RAISE NOTICE 'OK: mart.order_delivery проверена. Корректных строк: %. Допустимые аномалии источника: % заказов с передачей перевозчику до оплаты (рассинхрон систем), % доставленных заказов без полных дат.',
         v_delivery_rows, v_carrier_before_approval, v_missing_dates_delivered;
@@ -144,7 +177,7 @@ BEGIN
     -- ------------------------------------------------------------------------
     -- ТЕСТ 4: Проверка mart.seller_summary (Grain, полнота продавцов, выручка)
     -- ------------------------------------------------------------------------
-    SELECT COUNT(*), COUNT(DISTINCT seller_id), COALESCE(SUM(revenue_amount), 0.00)
+    SELECT COUNT(*), COUNT(DISTINCT seller_id), COALESCE(SUM(revenue), 0.00)
     INTO v_sellers_mart_count, v_sellers_distinct_count, v_seller_total_revenue
     FROM mart.seller_summary;
 
@@ -164,9 +197,9 @@ BEGIN
     END IF;
 
     -- Проверка выручки топ-1 продавца (контроль вопроса 2 хакатона: 226 987.93)
-    SELECT revenue_amount INTO v_top_seller_rev
+    SELECT revenue INTO v_top_seller_rev
     FROM mart.seller_summary
-    ORDER BY revenue_amount DESC
+    ORDER BY revenue DESC
     LIMIT 1;
 
     IF ABS(v_top_seller_rev - 226987.93) > 0.001 THEN

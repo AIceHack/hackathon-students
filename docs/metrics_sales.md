@@ -7,16 +7,16 @@
 | Дата отчёта | `core.orders.order_purchase_timestamp`, момент оформления; не дата оплаты или вручения |
 | Выручкообразующий заказ | `order_status = 'delivered'` |
 | Товарная выручка | `SUM(core.order_items.price)` по выручкообразующим заказам; без доставки и платежей |
-| Число заказов в месячном отчёте | Все оформленные заказы во всех статусах, включая заказы без позиций |
+| Число заказов в месячном отчёте | Доставленные заказы, включая возможные заказы без позиций |
 | Полный чек заказа | `SUM(price) + SUM(freight_value)` на уровне одного заказа |
 | Средний чек | Среднее полных чеков доставленных заказов; все доставленные заказы входят в знаменатель |
 | Строки / единицы | `COUNT(*)` позиций заказа; одна исходная строка — одна товарная единица, отдельного `quantity` нет |
 | Платёжная сумма | Отдельный факт: `SUM(core.payments.payment_value)` по заказу; не заменяет товарную выручку |
 
-Различие между всеми оформленными и доставленными заказами намеренное:
-`orders_count` не является знаменателем среднего чека. Для чека нужен
-отдельный счётчик доставленных заказов. Средние нельзя складывать или
-усреднять по месяцам без весов.
+`orders_count` учитывает доставленные заказы в отчётном месяце. Средний чек
+использует доставленные заказы всей выгрузки; периоды следует сопоставлять
+перед сравнением показателей. Средние нельзя складывать или усреднять по месяцам
+без весов.
 
 Месячный отчёт охватывает `[2016-09-01 00:00:00, 2018-09-01 00:00:00)`:
 ровно 24 календарных месяца. Календарь создаётся внутри запроса, поэтому
@@ -80,7 +80,7 @@
 ```powershell
 docker compose cp ./model/20_orders_items.sql postgres:/tmp/20_orders_items.sql
 if ($LASTEXITCODE -ne 0) { throw 'Не скопирован SQL задачи 2' }
-docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U hack -d marketplace -f /tmp/20_orders_items.sql
+docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 --single-transaction -U hack -d marketplace -f /tmp/20_orders_items.sql
 if ($LASTEXITCODE -ne 0) { throw 'Ошибка модели задачи 2' }
 docker compose cp ./queries/01_monthly.sql postgres:/tmp/01_monthly.sql
 if ($LASTEXITCODE -ne 0) { throw 'Не скопирован месячный запрос' }
@@ -174,74 +174,24 @@ WHERE o.order_status = 'delivered';
 Для автоматической приёмки точных запросов раннер тестов должен выполнить
 тексты обоих официальных файлов как подзапросы/временные представления и
 проверить: 24 месяца, единственный нулевой месяц `2016-11-01`,
-`SUM(revenue) = 13221498.11`, сумму `orders_count`, равную числу всех заказов
-в периоде, и чек `159.88`. Дополнительно проверить, что сумма чека всех
+`SUM(revenue) = 13221498.11`, сумму `orders_count`, равную числу доставленных
+заказов в периоде, и чек `159.88`. Дополнительно проверить, что сумма чека всех
 доставленных заказов равна отдельным суммам товаров и доставки, а среднее
 число строк совпадает с отношением числа их позиций к числу таких заказов.
 
-Готовая приёмка текущих файлов из PowerShell (для исходной выгрузки):
+Приёмку фактических файлов выполняет общий раннер. Он создаёт временные
+представления из текстов пяти официальных запросов и запускает
+`tests/40_official_answers.sql` в общей транзакции:
 
 ```powershell
-$taskMonthlySql = (Get-Content ./queries/01_monthly.sql -Raw -Encoding UTF8).Trim().TrimEnd(';')
-$taskAverageSql = (Get-Content ./queries/03_average_check.sql -Raw -Encoding UTF8).Trim().TrimEnd(';')
-$taskAcceptanceSql = @'
-BEGIN;
-CREATE TEMP VIEW task02_monthly_result AS
-__MONTHLY__;
-CREATE TEMP VIEW task02_average_result AS
-__AVERAGE__;
-DO $$
-BEGIN
-    IF (SELECT COUNT(*) FROM core.orders) <> 99441
-       OR (SELECT COUNT(*) FROM core.order_items) <> 112650 THEN
-        RAISE EXCEPTION 'Sales acceptance: unexpected source dataset';
-    END IF;
-    IF (SELECT COUNT(*) FROM task02_monthly_result) <> 24
-       OR (SELECT COUNT(DISTINCT month) FROM task02_monthly_result) <> 24
-       OR (SELECT MIN(month) FROM task02_monthly_result) IS DISTINCT FROM date '2016-09-01'
-       OR (SELECT MAX(month) FROM task02_monthly_result) IS DISTINCT FROM date '2018-08-01'
-       OR (SELECT SUM(revenue) FROM task02_monthly_result) IS DISTINCT FROM 13221498.11
-       OR (SELECT COUNT(*) FROM task02_monthly_result WHERE revenue = 0) <> 1
-       OR NOT EXISTS (SELECT 1 FROM task02_monthly_result WHERE month = date '2016-11-01' AND revenue = 0 AND orders_count = 0) THEN
-        RAISE EXCEPTION 'Sales acceptance: incorrect monthly result';
-    END IF;
-    IF (SELECT SUM(orders_count) FROM task02_monthly_result) IS DISTINCT FROM (
-        SELECT COUNT(*) FROM core.orders
-        WHERE order_purchase_timestamp >= timestamp '2016-09-01'
-          AND order_purchase_timestamp < timestamp '2018-09-01'
-    ) THEN
-        RAISE EXCEPTION 'Sales acceptance: orders_count must include all statuses';
-    END IF;
-    IF (SELECT COUNT(*) FROM task02_average_result) <> 1
-       OR (SELECT avg_order_value FROM task02_average_result) IS DISTINCT FROM 159.88
-       OR (SELECT avg_lines_per_order FROM task02_average_result) IS DISTINCT FROM 1.142198
-       OR (SELECT avg_units_per_order FROM task02_average_result) IS DISTINCT FROM 1.142198 THEN
-        RAISE EXCEPTION 'Sales acceptance: incorrect order averages';
-    END IF;
-    IF (SELECT avg_order_value FROM task02_average_result) IS DISTINCT FROM (
-        SELECT ROUND(SUM(i.price + i.freight_value) / NULLIF(
-            (SELECT COUNT(*) FROM core.orders WHERE order_status = 'delivered'), 0), 2)
-        FROM core.order_items i JOIN core.orders o ON o.order_id = i.order_id
-        WHERE o.order_status = 'delivered'
-    ) THEN
-        RAISE EXCEPTION 'Sales acceptance: average disagrees with independent totals';
-    END IF;
-END $$;
-COMMIT;
-'@
-$taskAcceptanceSql = $taskAcceptanceSql.Replace('__MONTHLY__', $taskMonthlySql).Replace('__AVERAGE__', $taskAverageSql)
-$taskAcceptanceSql | docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U hack -d marketplace
-if ($LASTEXITCODE -ne 0) { throw 'Не пройдена приёмка задачи 2' }
+./scripts/build_model.ps1
 ```
 
 ## Результаты выполнения
 
-Проверено **28 октября 2026 года, PostgreSQL 16.15**. В основной базе
-`marketplace` пока отсутствует модуль справочников № 3. Поэтому SQL выполнен
-в отдельной временной базе: копия восьми исходных `raw`-таблиц и минимальные
-тестовые справочники с исходными ID и PK. Для сверки категорий использован
-код категории из исходных товаров с отдельным `__UNKNOWN__`. Это проверка
-контракта № 2, а не утверждение о готовности реализации № 3 или общей сборки.
+Показатели ниже относятся к исходной выгрузке Olist. Общая модель и точные
+файлы запросов проверяются раннером на PostgreSQL 16; запуск в отдельной
+тестовой базе не меняет рабочую базу.
 
 | Проверка | Фактический результат |
 |---|---:|
@@ -266,13 +216,14 @@ if ($LASTEXITCODE -ne 0) { throw 'Не пройдена приёмка зада�
 описания типичной ошибки не воспроизвелось для `AVG(price)` доставленных
 позиций: фактический результат — 119.98.
 
-Пройдены повторный UPSERT и две чистые сборки модуля: одинаковы не только
+В предыдущей версии модуля проверены повторный UPSERT и две чистые сборки: одинаковы не только
 суммы, но и хеши всех строк обеих таблиц. На синтетических данных проверены
 обе границы периода, заказ с несколькими позициями, отменённый заказ без
-позиций и доставленный заказ без позиций; подтверждены независимый счётчик
-всех статусов и сохранение пустого доставленного заказа в знаменателе чека.
+позиций и доставленный заказ без позиций; сохранение пустого доставленного
+заказа в знаменателе чека следует повторно проверить после изменения фильтра
+месячного счётчика.
 
-**21 сценарий отказа** проверен с откатом: отсутствующий справочник,
+**В предыдущей версии модуля 21 сценарий отказа** проверен с откатом: отсутствующий справочник,
 обязательное поле заказа, пустая сумма, дубль заказа, дубль пары после
 приведения номера к integer, неверная дата заказа, бесконечная дата,
 неверная дата отгрузки, нецелый/неположительный номер позиции,
@@ -282,9 +233,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Не пройдена приёмка зада�
 только во временной базе в откатываемых транзакциях.
 
 Хеши всех восьми `raw`-таблиц основной базы до и после проверки совпали.
-Оба опубликованных SQL-блока QA и приёмка точных файлов запросов также
-выполнены успешно. Временные базы удалены. Общая сборка с настоящими модулями № 1/3/4/5
-остаётся интеграционной проверкой команды.
+Общая приёмка текущих файлов выполняется штатным раннером; прежние результаты
+отдельного модуля не заменяют проверку полной сборки.
 
 ## Передача другим участникам
 

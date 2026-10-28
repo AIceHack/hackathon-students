@@ -1,6 +1,32 @@
-BEGIN;
-
 CREATE SCHEMA IF NOT EXISTS core;
+
+-- Check payment amounts before numeric(14,2) conversion: casting or ROUND
+-- alone would silently lose fractions of a cent in a changed source.
+DO $$
+DECLARE
+    bad record;
+BEGIN
+    SELECT order_id, payment_sequential, payment_value INTO bad
+    FROM raw.order_payments
+    WHERE NULLIF(BTRIM(payment_value), '') IS NULL
+       OR NOT pg_input_is_valid(NULLIF(BTRIM(payment_value), ''), 'numeric')
+    LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION 'Invalid payment_value %, order_id %, payment %',
+            bad.payment_value, bad.order_id, bad.payment_sequential;
+    END IF;
+
+    SELECT p.order_id, p.payment_sequential, p.payment_value INTO bad
+    FROM raw.order_payments p
+    CROSS JOIN LATERAL (SELECT NULLIF(BTRIM(p.payment_value), '')::numeric AS value) amount
+    WHERE NOT (amount.value >= 0 AND amount.value < 1000000000000
+               AND amount.value = ROUND(amount.value, 2))
+    LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION 'payment_value must be finite, nonnegative and fit numeric(14,2) without rounding: %, order_id %, payment %',
+            bad.payment_value, bad.order_id, bad.payment_sequential;
+    END IF;
+END $$;
 
 -- ----------------------------------------------------------------------------
 -- 0. Журнал аномалий качества данных (не скрываем проблемы через INNER JOIN)
@@ -44,8 +70,8 @@ DROP TABLE IF EXISTS core.payments CASCADE;
 CREATE TABLE core.payments (
     order_id             text           NOT NULL,
     payment_sequential   integer        NOT NULL CHECK (payment_sequential >= 1),
-    payment_type         text           NOT NULL,
-    payment_installments integer        NOT NULL CHECK (payment_installments >= 0),
+    payment_type         text,
+    payment_installments integer        CHECK (payment_installments >= 0),
     payment_value        numeric(14, 2) NOT NULL CHECK (payment_value >= 0),
     CONSTRAINT pk_core_payments PRIMARY KEY (order_id, payment_sequential)
 );
@@ -62,9 +88,9 @@ INSERT INTO core.payments (
 SELECT
     btrim(order_id)                                      AS order_id,
     NULLIF(btrim(payment_sequential), '')::integer       AS payment_sequential,
-    COALESCE(NULLIF(btrim(payment_type), ''), 'unknown') AS payment_type,
+    NULLIF(btrim(payment_type), '')                     AS payment_type,
     NULLIF(btrim(payment_installments), '')::integer     AS payment_installments,
-    ROUND(NULLIF(btrim(payment_value), '')::numeric, 2)  AS payment_value
+    NULLIF(btrim(payment_value), '')::numeric(14, 2)    AS payment_value
 FROM raw.order_payments;
 
 -- Фиксация аномалий платежей в журнале
@@ -143,20 +169,20 @@ GROUP BY order_id;
 -- ----------------------------------------------------------------------------
 -- 2. Диагностика и создание таблицы core.reviews
 --    Grain: одна исходная строка отзыва из raw.order_reviews
---    review_id НЕ уникален глобально (один отзыв может относиться к нескольким заказам),
---    поэтому вводим суррогатный PK review_row_id, а review_id оставляем бизнес-полем.
+--    review_id НЕ уникален глобально; проверенный естественный ключ —
+--    пара (review_id, order_id), без потери исходных записей.
 -- ----------------------------------------------------------------------------
 DROP TABLE IF EXISTS core.reviews CASCADE;
 
 CREATE TABLE core.reviews (
-    review_row_id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     review_id               text      NOT NULL,
     order_id                text      NOT NULL,
-    review_score            integer   NOT NULL CHECK (review_score BETWEEN 1 AND 5),
+    review_score            integer   CHECK (review_score BETWEEN 1 AND 5),
     review_comment_title    text,
     review_comment_message  text,
-    review_creation_date    timestamp NOT NULL,
-    review_answer_timestamp timestamp NOT NULL
+    review_creation_date    timestamp,
+    review_answer_timestamp timestamp,
+    PRIMARY KEY (review_id, order_id)
 );
 
 COMMENT ON TABLE core.reviews IS 'Отзывы покупателей. Grain: исходная строка отзыва. NULL в тексте комментария не означает негативный отзыв или возврат.';
@@ -240,5 +266,3 @@ END $$;
 
 CREATE INDEX idx_core_reviews_order_id ON core.reviews (order_id);
 CREATE INDEX idx_core_reviews_review_id ON core.reviews (review_id);
-
-COMMIT;
