@@ -10,6 +10,7 @@ $reportDir = Join-Path ([System.IO.Path]::GetTempPath()) 'hackathon-model-build'
 $reportFile = Join-Path $reportDir ("build-{0}-{1}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $buildId)
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $copiedFiles = New-Object 'System.Collections.Generic.List[string]'
+$localFiles = New-Object 'System.Collections.Generic.List[string]'
 $failure = $null
 
 New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
@@ -42,7 +43,7 @@ function Invoke-Docker {
 }
 
 function Assert-TransactionSafe {
-    param([string]$Path, [string]$Label)
+    param([string]$Path, [string]$Label, [bool]$RequireSingleSelect = $false)
 
     # Strip strings, quoted identifiers, dollar-quoted bodies and comments
     # before inspecting top-level statements. A BEGIN in DO $$...$$ is valid.
@@ -109,11 +110,15 @@ function Assert-TransactionSafe {
         $i++
     }
 
-    foreach ($statement in $clean.ToString().Split(';')) {
+    $statements = @($clean.ToString().Split(';') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    foreach ($statement in $statements) {
         if ($statement -match '^\s*(BEGIN|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE)\b' -or
             $statement -match '^\s*(START|PREPARE)\s+TRANSACTION\b') {
             throw "Top-level transaction control is not allowed in $Label"
         }
+    }
+    if ($RequireSingleSelect -and ($statements.Count -ne 1 -or $statements[0] -notmatch '^\s*(SELECT|WITH)\b')) {
+        throw "Official answer must contain exactly one SELECT or WITH statement: $Label"
     }
 }
 
@@ -130,7 +135,16 @@ $files = @(
     'queries/02_top_sellers.sql',
     'queries/03_average_check.sql',
     'queries/04_retention.sql',
-    'queries/05_categories.sql'
+    'queries/05_categories.sql',
+    'tests/40_official_answers.sql'
+)
+
+$answerViews = @(
+    @{ File = 'queries/01_monthly.sql'; View = 'answer_01_monthly' },
+    @{ File = 'queries/02_top_sellers.sql'; View = 'answer_02_top_sellers' },
+    @{ File = 'queries/03_average_check.sql'; View = 'answer_03_average_check' },
+    @{ File = 'queries/04_retention.sql'; View = 'answer_04_retention' },
+    @{ File = 'queries/05_categories.sql'; View = 'answer_05_categories' }
 )
 
 Push-Location $root
@@ -142,7 +156,9 @@ try {
     $missing = @($files | Where-Object { -not (Test-Path -LiteralPath (Join-Path $root $_) -PathType Leaf) })
     if ($missing.Count -gt 0) { throw ("Required SQL files are missing:`n  " + ($missing -join "`n  ")) }
 
-    foreach ($file in $files) { Assert-TransactionSafe -Path (Join-Path $root $file) -Label $file }
+    foreach ($file in $files) {
+        Assert-TransactionSafe -Path (Join-Path $root $file) -Label $file -RequireSingleSelect ($file -like 'queries/*')
+    }
 
     Invoke-Docker -Arguments @('compose', 'version') -Step 'Check Docker Compose'
     Invoke-Docker -Arguments @('compose', 'exec', '-T', 'postgres', 'pg_isready', '-U', $User, '-d', $Database) -Step 'Check PostgreSQL container'
@@ -163,6 +179,20 @@ $$;
     $psqlArgs = @('compose', 'exec', '-T', 'postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '--single-transaction', '-U', $User, '-d', $Database)
     $index = 0
     foreach ($file in $files) {
+        if ($file -eq 'tests/40_official_answers.sql') {
+            # Wrap the exact official SQL as temporary views so the final test
+            # checks the actual outputs, not a second implementation of them.
+            foreach ($answer in $answerViews) {
+                $localWrapper = Join-Path $reportDir ("{0}_{1}.sql" -f $buildId, $answer.View)
+                $query = [System.IO.File]::ReadAllText((Join-Path $root $answer.File), [System.Text.Encoding]::UTF8).Trim().TrimEnd(';')
+                [System.IO.File]::WriteAllText($localWrapper, ("CREATE TEMP VIEW {0} AS`n{1};`n" -f $answer.View, $query), $utf8)
+                $localFiles.Add($localWrapper)
+                $targetWrapper = '/tmp/modelbuild_{0}_{1}.sql' -f $buildId, $answer.View
+                Invoke-Docker -Arguments @('compose', 'cp', $localWrapper, ("postgres:{0}" -f $targetWrapper)) -Step ("Prepare check for {0}" -f $answer.File)
+                $copiedFiles.Add($targetWrapper)
+                $psqlArgs += @('-c', ("\echo CHECK OUTPUT {0}" -f $answer.File), '-f', $targetWrapper)
+            }
+        }
         $index++
         $source = Join-Path $root $file
         $target = '/tmp/modelbuild_{0}_{1:D2}_{2}' -f $buildId, $index, (Split-Path -Leaf $file)
@@ -179,6 +209,13 @@ catch {
     Write-Log ("BUILD FAILED: {0}" -f $failure)
 }
 finally {
+    foreach ($localFile in $localFiles) {
+        try { [System.IO.File]::Delete($localFile) }
+        catch {
+            Write-Log ("LOCAL CLEANUP FAILED: {0}" -f $_.Exception.Message)
+            if (-not $failure) { $failure = $_.Exception.Message }
+        }
+    }
     if ($copiedFiles.Count -gt 0) {
         try {
             $cleanupArgs = @('compose', 'exec', '-T', 'postgres', 'rm', '-f', '--') + $copiedFiles.ToArray()

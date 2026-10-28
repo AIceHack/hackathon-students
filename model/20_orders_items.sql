@@ -1,6 +1,6 @@
 -- Task 02. Requires core.customers, core.products and core.sellers (task 03).
 -- Run with psql -X -v ON_ERROR_STOP=1. Never changes raw or other modules.
-BEGIN ISOLATION LEVEL REPEATABLE READ;
+-- The shared build runner supplies the transaction and locks the raw sources.
 SET LOCAL DateStyle = 'ISO, YMD';
 
 DO $$
@@ -233,5 +233,3 @@ BEGIN
         RAISE EXCEPTION 'Task 02: source/model row counts differ. Source deletions require the architect full rebuild; no rows are silently deleted.';
     END IF;
 END $$;
-
-COMMIT;

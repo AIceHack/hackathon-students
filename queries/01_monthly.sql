@@ -1,5 +1,4 @@
--- All placed orders are counted; only delivered item prices form revenue.
--- Aggregate independently so orders without items remain in orders_count.
+-- Count delivered orders and sum delivered item prices independently.
 WITH calendar AS (
     SELECT month_start::date AS month
     FROM generate_series(
@@ -13,6 +12,7 @@ WITH calendar AS (
 ), monthly_orders AS (
     SELECT month, COUNT(*) AS orders_count
     FROM orders_in_period
+    WHERE order_status = 'delivered'
     GROUP BY month
 ), monthly_revenue AS (
     SELECT o.month, SUM(i.price) AS revenue

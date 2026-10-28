@@ -262,7 +262,8 @@ powershell -ExecutionPolicy Bypass -File ./scripts/build_model.ps1
 `model/00_schema.sql` → `model/10_dimensions.sql` →
 `model/20_orders_items.sql` → `model/30_payments_reviews.sql` →
 `model/40_marts.sql` → `tests/10_integrity.sql` →
-`tests/20_reconciliation.sql` → `tests/30_marts.sql` → запросы `01`–`05`.
+`tests/20_reconciliation.sql` → `tests/30_marts.sql` → запросы `01`–`05` →
+`tests/40_official_answers.sql` для проверки фактических результатов этих файлов.
 
 №1 проверяет ключи, ссылки, сохранение записей и неизменность `raw`; №4 —
 денежные сверки и корректность соединений; №5 — зерно и результаты витрин.

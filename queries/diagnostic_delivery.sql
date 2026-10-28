@@ -44,7 +44,7 @@ WITH monthly_delivery_stats AS (
             ORDER BY days_purchase_to_delivery
         ) FILTER (WHERE order_status = 'delivered')::numeric AS raw_median_delivery_days,
         AVG(delivery_delay_days) FILTER (WHERE is_late = true)::numeric AS raw_avg_delay_if_late,
-        COUNT(*) FILTER (WHERE has_missing_dates = true)::integer AS missing_dates_orders
+        COUNT(*) FILTER (WHERE has_incomplete_dates = true)::integer AS missing_dates_orders
     FROM mart.order_delivery
     WHERE purchase_month IS NOT NULL
     GROUP BY purchase_month
@@ -58,16 +58,10 @@ SELECT
     late_orders,
 
     -- Доля просроченных доставок (%) с защитой от деления на 0
-    COALESCE(
-        ROUND((100.0 * late_orders / NULLIF(valid_dates_orders, 0))::numeric, 2),
-        0.00
-    ) AS late_orders_pct,
+    ROUND((100.0 * late_orders / NULLIF(valid_dates_orders, 0))::numeric, 2) AS late_orders_pct,
 
     -- Доля своевременных доставок (%) (SLA compliance)
-    COALESCE(
-        ROUND((100.0 * ontime_orders / NULLIF(valid_dates_orders, 0))::numeric, 2),
-        0.00
-    ) AS ontime_orders_pct,
+    ROUND((100.0 * ontime_orders / NULLIF(valid_dates_orders, 0))::numeric, 2) AS ontime_orders_pct,
 
     -- Средняя длительность доставки в днях
     ROUND(raw_avg_delivery_days, 2) AS avg_delivery_days,

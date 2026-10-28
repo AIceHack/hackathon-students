@@ -4,7 +4,6 @@ WITH orders_per_person AS (
         COUNT(DISTINCT o.order_id) AS orders_cnt
     FROM core.customers c
     JOIN core.orders    o ON o.customer_id = c.customer_id
-    WHERE o.order_status = 'delivered' 
     GROUP BY c.customer_unique_id
 )
 SELECT
